@@ -1,0 +1,111 @@
+import os
+import re
+import json
+import pandas as pd
+from groq import Groq
+from tqdm import tqdm
+
+# ----------------------------------------------------------------------------
+# 0) Configuration
+# ----------------------------------------------------------------------------
+API_KEY = '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'  # replace with your Groq API key
+MODEL_NAME = 'llama3-70b-8192'  # Groq-compatible Llama 70B
+DATA_PATH = '/Users/kristianmiok/Desktop/SMASH/Data/CoT XAI/CoT XAI Temp 0.5_5.csv'
+OUTPUT_PATH = '/Users/kristianmiok/Desktop/SMASH/Data/CoT XAI/Evaluation CoT XAI Temp 0.5_5.csv'
+
+os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+
+# ----------------------------------------------------------------------------
+# 1) Load Data
+# ----------------------------------------------------------------------------
+df = pd.read_csv(DATA_PATH)
+assert 'reasoning_full_text' in df.columns and 'reasoning_focus' in df.columns, \
+    "Input CSV must contain 'reasoning_full_text' and 'reasoning_focus'."
+
+# Initialize evaluation columns
+df['score_full'] = None
+df['comment_full'] = None
+df['score_focus'] = None
+df['comment_focus'] = None
+
+# ----------------------------------------------------------------------------
+# 2) Groq Client Setup
+# ----------------------------------------------------------------------------
+client = Groq(api_key=API_KEY)
+
+SYSTEM_MSG = {
+    "role": "system",
+    "content": (
+        "You are a clinical urologist specializing in kidney stone management. "
+        "Evaluate the following chain-of-thought explanation for a long-stay kidney stone patient. "
+        "On a scale from 1 (poor) to 5 (excellent), rate how clearly and helpfully this explanation justifies why the patient had a prolonged hospital stay. "
+        "Respond with ONLY a JSON object with keys 'score' (int) and 'comment' (one-sentence justification)."
+    )
+}
+
+# ----------------------------------------------------------------------------
+# 3) Prompt builder
+# ----------------------------------------------------------------------------
+def make_eval_messages(reasoning: str):
+    return [
+        SYSTEM_MSG,
+        {"role": "user", "content": f"Explanation:\n{reasoning}"}
+    ]
+
+# ----------------------------------------------------------------------------
+# 4) Perform evaluation
+# ----------------------------------------------------------------------------
+for idx, row in tqdm(df.iterrows(), total=len(df), desc="Evaluating explanations"):
+    # Full-text explanation
+    messages_full = make_eval_messages(row['reasoning_full_text'])
+    resp_full = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages_full,
+        temperature=0.0,
+        max_tokens=100
+    )
+    out_full = resp_full.choices[0].message.content.strip()
+    # Extract JSON
+    m = re.search(r"\{.*\}", out_full, re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            df.at[idx, 'score_full'] = int(obj.get('score', 0))
+            df.at[idx, 'comment_full'] = obj.get('comment', '')
+        except Exception:
+            df.at[idx, 'comment_full'] = out_full
+    else:
+        df.at[idx, 'comment_full'] = out_full
+
+    # Hybrid explanation
+    messages_focus = make_eval_messages(row['reasoning_focus'])
+    resp_focus = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages_focus,
+        temperature=0.0,
+        max_tokens=100
+    )
+    out_focus = resp_focus.choices[0].message.content.strip()
+    m2 = re.search(r"\{.*\}", out_focus, re.DOTALL)
+    if m2:
+        try:
+            obj2 = json.loads(m2.group(0))
+            df.at[idx, 'score_focus'] = int(obj2.get('score', 0))
+            df.at[idx, 'comment_focus'] = obj2.get('comment', '')
+        except Exception:
+            df.at[idx, 'comment_focus'] = out_focus
+    else:
+        df.at[idx, 'comment_focus'] = out_focus
+
+# ----------------------------------------------------------------------------
+# 5) Save Results
+# ----------------------------------------------------------------------------
+df.to_csv(OUTPUT_PATH, index=False)
+print(f"Saved evaluation scores to {OUTPUT_PATH}")
+
+# ----------------------------------------------------------------------------
+# 6) Print copyable table
+# ----------------------------------------------------------------------------
+cols = ['note_id', 'score_full', 'comment_full', 'score_focus', 'comment_focus']
+print("\nEvaluation Summary (plain text):\n")
+print(df[cols].to_string(index=False))
