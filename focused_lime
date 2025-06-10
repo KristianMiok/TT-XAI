@@ -1,0 +1,294 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import torch
+import spacy
+import matplotlib.pyplot as plt
+
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, auc
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from rakun2 import RakunKeyphraseDetector
+import torch.nn.functional as F
+from lime.lime_text import LimeTextExplainer
+
+# ------------------------------------------------------------------------------
+# 0) Reproducibility & Device Configuration
+# ------------------------------------------------------------------------------
+SEED = 42
+os.environ['PYTHONHASHSEED'] = str(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# For BERT: prefer GPU (CUDA > MPS), else CPU
+if torch.cuda.is_available():
+    BERT_DEVICE = torch.device('cuda')
+elif torch.backends.mps.is_available():
+    BERT_DEVICE = torch.device('mps')
+else:
+    BERT_DEVICE = torch.device('cpu')
+print('BERT will use device:', BERT_DEVICE)
+
+# For all other operations, force CPU
+DEVICE = torch.device('cpu')
+print('Other operations will use device:', DEVICE)
+
+# ------------------------------------------------------------------------------
+# 1) Load & Preprocess Data
+# ------------------------------------------------------------------------------
+DATA_PATH = "/Users/kristianmiok/Desktop/SMASH/Data/ks_discharge_LOS.csv"
+print(f"Loading data from: {DATA_PATH}")
+df = pd.read_csv(DATA_PATH).dropna(subset=['text','LOS_long'])
+df['label'] = df['LOS_long'].astype(int)
+
+# ------------------------------------------------------------------------------
+# 2) Extract Rakun Keywords & Med7 NER
+# ------------------------------------------------------------------------------
+print('Initializing Rakun and Med7...')
+detector = RakunKeyphraseDetector({
+    'num_keywords': 1024,
+    'merge_threshold': 1.1,
+    'alpha': 0.3,
+    'token_prune_len': 3
+})
+
+def extract_keywords(text):
+    kws = detector.find_keywords(text, input_type='string')[:512]
+    return [kw for kw,_ in kws]
+
+df['keywords_set'] = df['text'].apply(extract_keywords)
+
+print('Loading Med7 model…')
+med7 = spacy.load('en_core_med7_lg')
+
+def extract_clinical_tokens(text):
+    doc = med7(text)
+    return [ent.text.lower() for ent in doc.ents if ent.label_ not in {'DOSAGE','FREQUENCY'}]
+
+df['ner_set'] = df['text'].apply(extract_clinical_tokens)
+df['focus_set'] = df.apply(lambda r: list(set(r['ner_set']) | set(r['keywords_set'])), axis=1)
+
+# ------------------------------------------------------------------------------
+# 3) Train/Test Split and ModernBERT Setup
+# ------------------------------------------------------------------------------
+txts, labs = df['text'], df['label']
+X_train, X_test, y_train, y_test = train_test_split(
+    txts, labs, test_size=0.2, stratify=labs, random_state=SEED
+)
+
+MODEL_NAME = 'answerdotai/ModernBERT-base'
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+class MedicalDataset(Dataset):
+    def __init__(self, texts, labels):
+        self.texts  = texts.tolist()
+        self.labels = labels.tolist()
+    def __len__(self): return len(self.texts)
+    def __getitem__(self, i):
+        enc = tokenizer(
+            self.texts[i], max_length=512,
+            truncation=True, padding='max_length',
+            return_tensors='pt'
+        )
+        return {
+            'input_ids': enc.input_ids.squeeze(0),
+            'attention_mask': enc.attention_mask.squeeze(0),
+            'labels': torch.tensor(self.labels[i], dtype=torch.long)
+        }
+
+train_loader = DataLoader(
+    MedicalDataset(X_train, y_train), batch_size=4, shuffle=True
+)
+test_loader = DataLoader(
+    MedicalDataset(X_test, y_test), batch_size=8
+)
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL_NAME, num_labels=2
+).to(BERT_DEVICE)
+optimizer = AdamW(model.parameters(), lr=1e-5)
+
+# Train ModernBERT
+model.train()
+for epoch in range(2):
+    total_loss = 0.0
+    for batch in train_loader:
+        optimizer.zero_grad()
+        out = model(
+            input_ids=batch['input_ids'].to(BERT_DEVICE),
+            attention_mask=batch['attention_mask'].to(BERT_DEVICE),
+            labels=batch['labels'].to(BERT_DEVICE)
+        )
+        out.loss.backward()
+        optimizer.step()
+        total_loss += out.loss.item()
+    print(f'Epoch {epoch+1} — avg loss: {total_loss/len(train_loader):.4f}')
+
+# ------------------------------------------------------------------------------
+# 4) Evaluate ModernBERT
+# ------------------------------------------------------------------------------
+model.eval()
+all_preds, all_labels = [], []
+with torch.no_grad():
+    for batch in test_loader:
+        out = model(
+            input_ids=batch['input_ids'].to(BERT_DEVICE),
+            attention_mask=batch['attention_mask'].to(BERT_DEVICE)
+        )
+        p = torch.argmax(out.logits, dim=1).cpu().numpy()
+        all_preds.extend(p)
+        all_labels.extend(batch['labels'].numpy())
+print('Test Accuracy:', accuracy_score(all_labels, all_preds))
+print('Test F1 Score:', f1_score(all_labels, all_preds))
+
+# ------------------------------------------------------------------------------
+# 5) Prediction & MC-Dropout on CPU
+# ------------------------------------------------------------------------------
+model_cpu = model.to(DEVICE)
+
+def predict_proba(texts):
+    enc = tokenizer(
+        texts, padding=True, truncation=True,
+        max_length=512, return_tensors='pt'
+    )
+    with torch.no_grad():
+        logits = model_cpu(
+            input_ids=enc.input_ids,
+            attention_mask=enc.attention_mask
+        ).logits
+    return F.softmax(logits, dim=1).numpy()
+
+
+def enable_dropout(m):
+    for l in m.modules():
+        if isinstance(l, torch.nn.Dropout):
+            l.train()
+
+
+def mc_dropout_proba(texts, n_mc=50):
+    """
+    Monte Carlo dropout using the CPU-bound model.
+    """
+    # Ensure we use the CPU model
+    model_cpu.eval()
+    enable_dropout(model_cpu)
+    probs = []
+    for _ in range(n_mc):
+        # Tokenize on CPU
+        enc = tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors='pt')
+        with torch.no_grad():
+            out = model_cpu(input_ids=enc.input_ids, attention_mask=enc.attention_mask)
+        probs.append(F.softmax(out.logits, dim=1)[:,1].cpu().numpy())
+    arr = np.stack(probs)
+    return arr.mean(0), arr.var(0)
+
+mean_p, var_p = mc_dropout_proba(X_test.tolist(), n_mc=50)
+
+# ------------------------------------------------------------------------------
+# 6) Select 20 True Positives & Save Summary
+# ------------------------------------------------------------------------------
+preds = (mean_p >= 0.5).astype(int)
+y_arr = y_test.to_numpy()
+mask_tp = (preds==1) & (y_arr==1)
+idxs = np.where(mask_tp)[0]
+top20 = list(random.Random(SEED).sample(list(idxs), k=min(20, len(idxs))))
+
+selected_idxs = X_test.index[top20]
+meta_cols = ['note_id','subject_id','hadm_id','LOS_days','LOS_long','text']
+existing = [c for c in meta_cols if c in df.columns]
+summary_df = df.loc[selected_idxs, existing].copy()
+summary_df['predicted'] = preds[top20]
+summary_df['true'] = y_arr[top20]
+summary_dir = os.path.join(
+    os.path.dirname(DATA_PATH), '20 Certain'
+)
+os.makedirs(summary_dir, exist_ok=True)
+summary_path = os.path.join(summary_dir, 'top20_summary.csv')
+summary_df.to_csv(summary_path, index=False)
+print(f'Saved summary to {summary_path}')
+
+# ------------------------------------------------------------------------------
+# 7) LIME Explanations & Deletion Curves
+# ------------------------------------------------------------------------------
+explainer = LimeTextExplainer(class_names=['short','long'])
+
+def explain_lime(text, num_features=10):
+    exp = explainer.explain_instance(
+        text, predict_proba, num_features=num_features, labels=[1]
+    )
+    return [re.sub(r'^[+-]?', '', t[0]) for t in exp.as_list(label=1)]
+
+
+def mask_topk(text, toks, k):
+    rem = set(toks[:k])
+    return ' '.join('' if w in rem else w for w in text.split())
+
+
+def deletion_curve(text, toks, fractions):
+    scores = []
+    k = len(toks)
+    for f in fractions:
+        num_remove = int(np.floor(f * k))
+        pert = mask_topk(text, toks, num_remove)
+        scores.append(predict_proba([pert])[0][1])
+    return np.array(fractions), np.array(scores)
+
+fractions = np.linspace(0,1,11)
+all_so, all_sf, all_sr = [], [], []
+for idx in top20:
+    text = X_test.iloc[idx]
+    orig_toks  = explain_lime(text, 10)
+    focus_toks = explain_lime(text, 10)  # or use df.loc[...] focus_set
+    rand_words = list(set(text.split()))
+    rand_toks  = random.Random(SEED+idx).sample(
+        rand_words, k=min(10, len(rand_words))
+    )
+
+    fo, so = deletion_curve(text, orig_toks, fractions)
+    ff, sf = deletion_curve(text, focus_toks, fractions)
+    fr, sr = deletion_curve(text, rand_toks, fractions)
+
+    all_so.append(so)
+    all_sf.append(sf)
+    all_sr.append(sr)
+
+    auc_o = auc(fo, so)
+    auc_f = auc(ff, sf)
+    auc_r = auc(fr, sr)
+
+    plt.figure(figsize=(6,4))
+    plt.plot(fo, so, '-o', label=f'Orig AUC={auc_o:.3f}')
+    plt.plot(ff, sf, '-o', label=f'Focus AUC={auc_f:.3f}')
+    plt.plot(fr, sr, '-o', label=f'Rand AUC={auc_r:.3f}')
+    plt.title(f'Deletion Plot for instance {idx}')
+    plt.xlabel('Fraction removed')
+    plt.ylabel('P(long stay)')
+    plt.legend(); plt.grid(True)
+    plt.savefig(os.path.join(summary_dir, f'instance_{idx}.png'))
+    plt.close()
+
+mean_so = np.mean(all_so, axis=0)
+mean_sf = np.mean(all_sf, axis=0)
+mean_sr = np.mean(all_sr, axis=0)
+
+auc_o = auc(fractions, mean_so)
+auc_f = auc(fractions, mean_sf)
+auc_r = auc(fractions, mean_sr)
+
+plt.figure(figsize=(6,4))
+plt.plot(fractions, mean_so, '-o', label=f'Mean Orig AUC={auc_o:.3f}')
+plt.plot(fractions, mean_sf, '-o', label=f'Mean Focus AUC={auc_f:.3f}')
+plt.plot(fractions, mean_sr, '-o', label=f'Mean Rand AUC={auc_r:.3f}')
+plt.title('Average Deletion Plot Across Instances')
+plt.xlabel('Fraction removed')
+plt.ylabel('P(long stay)')
+plt.legend(); plt.grid(True)
+plt.savefig(os.path.join(summary_dir, 'overall_deletion.png'))
+plt.close()
+print(f'Overall deletion plot saved to {summary_dir}')
