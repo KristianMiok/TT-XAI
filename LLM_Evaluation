@@ -8,7 +8,7 @@ from tqdm import tqdm
 # ----------------------------------------------------------------------------
 # 0) Configuration
 # ----------------------------------------------------------------------------
-API_KEY = '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'  # replace with your Groq API key
+API_KEY = 'Groq API key'  # replace with your Groq API key
 MODEL_NAME = 'llama3-70b-8192'  # Groq-compatible Llama 70B
 DATA_PATH = '/Users/kristianmiok/Desktop/SMASH/Data/CoT XAI/CoT XAI Temp 0.5_5.csv'
 OUTPUT_PATH = '/Users/kristianmiok/Desktop/SMASH/Data/CoT XAI/Evaluation CoT XAI Temp 0.5_5.csv'
