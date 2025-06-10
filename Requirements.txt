@@ -1,0 +1,11 @@
+pandas
+numpy
+torch
+transformers
+scikit-learn
+spacy
+matplotlib
+lime
+rakun2
+groq
+tqdm
