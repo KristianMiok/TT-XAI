@@ -1,0 +1,114 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import torch
+import spacy
+import requests
+from tqdm import tqdm
+from rakun2 import RakunKeyphraseDetector
+
+# ----------------------------------------------------------------------------
+# 0) Setup & Reproducibility
+# ----------------------------------------------------------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# ----------------------------------------------------------------------------
+# 1) Load & preprocess data
+# ----------------------------------------------------------------------------
+DATA_PATH = "/Users/kristianmiok/Desktop/SMASH/Data/top20_summary.csv"
+OUT_PATH  = "/Users/kristianmiok/Desktop/SMASH/Data/ks_discharge_LOS_sampled_reasoning2.csv"
+os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+
+df = pd.read_csv(DATA_PATH).dropna(subset=["text","LOS_long"])
+long_stay_df = df[df['LOS_long'].astype(int) == 1].copy()
+sampled_df    = long_stay_df
+# ----------------------------------------------------------------------------
+# 2) Extract keywords set (Rakun) and clinical NER set (Med7)
+# ----------------------------------------------------------------------------
+rk_detector = RakunKeyphraseDetector({
+    "num_keywords": 1024,
+    "merge_threshold": 1.1,
+    "alpha": 0.3,
+    "token_prune_len": 3
+})
+print("Loading Med7 model...")
+med7 = spacy.load("en_core_med7_lg")
+
+def extract_keywords(text):
+    kws = rk_detector.find_keywords(text, input_type="string")[:1024]
+    return {kw for kw, _ in kws}
+
+def extract_clinical_tokens(text):
+    doc = med7(text)
+    return {ent.text.lower() for ent in doc.ents if ent.label_ not in {"DOSAGE","FREQUENCY"}}
+
+sampled_df['keywords_set'] = sampled_df['text'].apply(extract_keywords)
+sampled_df['ner_set']      = sampled_df['text'].apply(extract_clinical_tokens)
+sampled_df['focus_set']    = sampled_df.apply(lambda r: r['keywords_set'] | r['ner_set'], axis=1)
+
+# Initialize reasoning columns
+sampled_df['reasoning_full_text'] = ""
+sampled_df['reasoning_focus']     = ""
+
+# ----------------------------------------------------------------------------
+# 3) Llama Reasoning Calls
+# ----------------------------------------------------------------------------
+def call_ollama_llama3(prompt: str) -> str:
+    try:
+        resp = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": "deepseek-r1:14b", "prompt": prompt, "stream": False},
+            timeout=300
+        )
+        print(f"HTTP {resp.status_code} | Prompt len: {len(prompt)}")
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get('response', '').strip()
+    except Exception as e:
+        print("Error calling Llama3:", e)
+        return ""
+
+# Original full-text prompt (concise)
+def reasoning_full_text(text: str) -> str:
+    prompt = (
+        "You are a clinical urologist specializing in kidney stone management. "
+        "Provide a **concise**, numbered list of **up to 3** reasoning steps—each **one sentence**—explaining why this clinical note indicates a prolonged hospital stay.\\n\\n"
+        f"Full Clinical Note:\\n{text}\\n\\n"
+        "Reasoning steps:"
+    )
+    return call_ollama_llama3(prompt)
+
+# Hybrid prompt using both keywords and full text (concise)
+def reasoning_focus_keywords(text: str, keywords: set) -> str:
+    sorted_kw = sorted(keywords)
+    prompt = (
+        "You are a clinical urologist specializing in kidney stone management. "
+        "Provide a **concise**, numbered list of **up to 3** reasoning steps—each **one sentence**—explaining why this patient had a prolonged stay. "
+        "First use the key clinical findings, then refer to the full note for context.\\n\\n"
+        f"Key Clinical Findings: {', '.join(sorted_kw)}\\n\\n"
+        f"Full Clinical Note:\\n{text}\\n\\n"
+        "Reasoning steps:"
+    )
+    return call_ollama_llama3(prompt)
+
+# ----------------------------------------------------------------------------
+# 4) Generate reasoning for sampled instances
+# ----------------------------------------------------------------------------
+for i, row in tqdm(sampled_df.iterrows(), total=len(sampled_df), desc="Reasoning"):
+    txt = row['text']
+    sampled_df.at[i, 'reasoning_full_text'] = reasoning_full_text(txt)
+    sampled_df.at[i, 'reasoning_focus']     = reasoning_focus_keywords(txt, row['focus_set'])
+
+# ----------------------------------------------------------------------------
+# 5) Save sampled results
+# ----------------------------------------------------------------------------
+sampled_df.to_csv(OUT_PATH, index=False)
+print(f"Saved sampled reasoning for {len(sampled_df)} cases to {OUT_PATH}")
